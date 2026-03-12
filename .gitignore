@@ -1,0 +1,52 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ---- Virtual environment ----
+.venv/
+venv/
+env/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+*.ipynb
+
+# ---- ML artefacts ----
+*.h5
+*.keras
+*.ckpt
+*.ckpt.*
+*.pb
+*.tflite
+*.onnx
+*.pkl
+*.npy
+*.npz
+training_metrics.png
+results.png
+
+# ---- Data folders ----
+DATA/
+DATA.zip
+data/
+big_data/
+small_data/
+dataset/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
