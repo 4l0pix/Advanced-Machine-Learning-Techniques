@@ -1,0 +1,1520 @@
+"""
+KOUKOSIAS ATHANASIOS-UTH-2026
+DATASET:hThe data for this excersise were gathered by using OpenMeteo free API
+
+"""
+
+# --------------------------------------------------------------
+#  config.py  –  change values here, they apply to every model
+# --------------------------------------------------------------
+
+#model hyperparameters
+HIDDEN_SIZE = 128       #LSTM / GRU hidden units per layer
+NUM_LAYERS = 1        #number of stacked recurrent layers
+LEARNING_RATE = 1e-3     #adam learning rate
+EPOCHS = 300      #training epochs per model
+SEQ_LEN = 6        #look-back window in months
+CLIP_GRAD = 5.0      #gradient clipping (max norm)
+
+#data
+TRAIN_YEARS = list(range(2018, 2025))   #2018 – 2024 inclusive
+PREDICT_YEAR = 2025
+LAT = 39.3637   #Karditsa, Greece
+LON = 21.9214
+CACHE_CSV = "weather_cache.csv"       #set to None to always re-fetch(no need, really...)
+
+#misc
+SEED = 42
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+# --------------------------------------------------------------
+#  data.py  –  fetch data from open meteo
+# --------------------------------------------------------------
+import os
+import requests
+import numpy as np
+import pandas as pd
+
+from config import LAT, LON, CACHE_CSV, TRAIN_YEARS, PREDICT_YEAR, SEQ_LEN
+
+
+def fetch_open_meteo(start: str, end: str) -> pd.DataFrame:
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude":   LAT,
+        "longitude":  LON,
+        "start_date": start,
+        "end_date":   end,
+        "daily":      "temperature_2m_mean",
+        "timezone":   "Europe/Athens",
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    raw = r.json()["daily"]
+    df = pd.DataFrame({"date": raw["time"], "temp": raw["temperature_2m_mean"]})
+    df["date"] = pd.to_datetime(df["date"])
+    df["temp"] = df["temp"].interpolate()   #fill any rare nan gaps
+    return df
+
+
+def load_daily() -> pd.DataFrame:
+    #return a daily DataFrame.
+    #uses the CSV cache if it fully covers the required date range
+    #downloads and saves otherwise.
+
+    all_years = sorted(set(TRAIN_YEARS + [PREDICT_YEAR]))
+    start = f"{min(all_years)}-01-01"
+    end = f"{max(all_years)}-12-31"
+
+    if CACHE_CSV and os.path.exists(CACHE_CSV):
+        cached = pd.read_csv(CACHE_CSV, parse_dates=["date"])
+        cached_start = cached["date"].min().strftime("%Y-%m-%d")
+        cached_end = cached["date"].max().strftime("%Y-%m-%d")
+
+        if cached_start <= start and cached_end >= end:
+            print(f"loaded from cache: {CACHE_CSV}")
+            return cached
+
+        print(f"cache only covers {cached_start} --> {cached_end}. Re-fetching …")
+
+    print(f"fetching Open-Meteo data {start} --> {end} …")
+    df = fetch_open_meteo(start, end)
+
+    if CACHE_CSV:
+        df.to_csv(CACHE_CSV, index=False)
+        print(f"saved to cache: {CACHE_CSV}")
+
+    return df
+
+
+def build_monthly(daily: pd.DataFrame) -> pd.DataFrame:
+    #Aggregate daily rows into monthly averages. Returns [year, month, temp]
+    daily = daily.copy()
+    daily["year"] = daily["date"].dt.year
+    daily["month"] = daily["date"].dt.month
+    monthly = (
+        daily.groupby(["year", "month"])["temp"]
+             .mean()
+             .reset_index()
+             .sort_values(["year", "month"])
+             .reset_index(drop=True)
+    )
+    return monthly
+
+
+def prepare_training_data(monthly: pd.DataFrame):
+    """
+    Normalise using training-year statistics and build sliding-window sequences.
+
+    Returns:
+        X          – (N, SEQ_LEN) input sequences  [normalised]
+        y          – (N,)         targets           [normalised]
+        norm_train – full normalised training series (used as inference seed)
+        mu, sigma  – scalars for de-normalising predictions
+    """
+    train_temps = (
+        monthly[monthly["year"].isin(TRAIN_YEARS)]["temp"]
+        .values.astype(np.float32)
+    )
+    mu = train_temps.mean()
+    sigma = train_temps.std()
+    norm_train = (train_temps - mu) / sigma
+
+    X, y = [], []
+    for i in range(len(norm_train) - SEQ_LEN):
+        X.append(norm_train[i : i + SEQ_LEN])
+        y.append(norm_train[i + SEQ_LEN])
+
+    return (np.array(X, dtype=np.float32), np.array(y, dtype=np.float32),norm_train, float(mu), float(sigma) )
+
+
+# --------------------------------------------------------------
+# main.py  –  train LSTM family models, evaluate, and plot results
+# --------------------------------------------------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.ticker as ticker
+import warnings
+warnings.filterwarnings("ignore")
+
+from config import TRAIN_YEARS, PREDICT_YEAR, MONTHS
+from data   import load_daily, build_monthly, prepare_training_data
+
+import model_lstm
+import model_bilstm
+import model_gru
+import model_convlstm
+import model_attention_lstm
+
+MODELS = [
+    model_lstm,
+    model_bilstm,
+    model_gru,
+    model_convlstm,
+    model_attention_lstm,
+]
+
+COLORS = {
+    "Classic LSTM":     "#4C9BE8",
+    "Bi-LSTM":          "#E8834C",
+    "GRU":              "#4CE87A",
+    "ConvLSTM":         "#C04CE8",
+    "LSTM + Attention": "#E8D54C",
+}
+
+BG_DARK = "#0F1117"
+BG_PANEL = "#1A1D27"
+GRID_COL = "#2A2D3A"
+
+
+# ----------------|METRICS|----------------
+
+def compute_metrics(result: dict, X: np.ndarray, y: np.ndarray, mu: float, sigma: float, model_module) -> dict:
+    #evaluate the trained model on the training sequences.
+
+    preds_norm = np.array([model_module.forward(x, result["weights"]) for x in X])
+    y_real = y * sigma + mu
+    p_real = preds_norm * sigma + mu
+
+    residuals = y_real - p_real
+    mse = float(np.mean(residuals ** 2))
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(residuals)))
+    ss_res = float(np.sum(residuals ** 2))
+    ss_tot = float(np.sum((y_real - y_real.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    final_loss = result["losses"][-1]
+    #returns a dict with MSE, RMSE (°C), MAE (°C), R^2, final_loss.
+    return {"MSE": mse, "RMSE": rmse, "MAE": mae, "R2": r2, "final_loss": final_loss}
+
+
+# ----------------|HELPER(just for the aesthetics:)|----------------
+
+def _style_ax(ax, title=None, xlabel=None, ylabel=None, fontsize=11):
+    ax.set_facecolor(BG_PANEL)
+    ax.tick_params(colors="white", labelsize=8)
+    ax.spines[:].set_color(GRID_COL)
+    ax.grid(alpha=0.18, color="white", linestyle="--", linewidth=0.5)
+    if title:   ax.set_title(title,   color="white", fontsize=fontsize, pad=8)
+    if xlabel:  ax.set_xlabel(xlabel, color="white", fontsize=9)
+    if ylabel:  ax.set_ylabel(ylabel, color="white", fontsize=9)
+
+
+# ----------------|PLOTING|----------------
+
+def plot_results(results: list, metrics: list,
+                 monthly: pd.DataFrame, mu: float, sigma: float):
+    """
+    Layout (5 rows × 2 cols):
+      Row 0  [full-width]  – 2025 predictions
+      Row 1  [full-width]  – training loss curves (annotated)
+      Row 2  left          – RMSE (°C) bar chart per model
+             right         – MAE  (°C) bar chart per model
+      Row 3  left          – R^2        bar chart per model
+             right         – model disagreement (spread)
+      Row 4  [full-width]  – metrics summary table
+    """
+    fig = plt.figure(figsize=(22, 24), facecolor=BG_DARK)
+    gs = gridspec.GridSpec(5, 2, figure=fig, hspace=0.52, wspace=0.32, top=0.95, bottom=0.03)
+
+    ax_pred = fig.add_subplot(gs[0, :])
+    ax_loss = fig.add_subplot(gs[1, :])
+    ax_rmse = fig.add_subplot(gs[2, 0])
+    ax_mae = fig.add_subplot(gs[2, 1])
+    ax_r2 = fig.add_subplot(gs[3, 0])
+    ax_spread = fig.add_subplot(gs[3, 1])
+    ax_table = fig.add_subplot(gs[4, :])
+
+    names = [r["name"] for r in results]
+    colors = [COLORS[n]  for n in names]
+
+    # ----------------Row 0: 2025 predictions----------------------
+    actual = monthly[monthly["year"] == PREDICT_YEAR]
+    if not actual.empty:
+        ax_pred.plot(range(1, len(actual) + 1), actual["temp"].values, "w--", linewidth=2.5, label="Actual 2025", zorder=5)
+
+    all_preds = []
+    for r in results:
+        preds_real = np.array(r["preds_2025"]) * sigma + mu
+        all_preds.append(preds_real)
+        ax_pred.plot(range(1, 13), preds_real, color=COLORS[r["name"]], linewidth=2, marker="o", markersize=6, label=r["name"])
+
+    _style_ax(ax_pred, title="2025 Monthly Average Temperature Predictions – Karditsa, Greece", ylabel="Temperature (°C)", fontsize=13)
+    ax_pred.set_xticks(range(1, 13))
+    ax_pred.set_xticklabels(MONTHS, color="white")
+    ax_pred.legend(facecolor=BG_PANEL, labelcolor="white", fontsize=9, framealpha=0.8, edgecolor=GRID_COL)
+
+    # ------------------Row 1: training loss + final-loss annotations -------------------------
+    for r, m in zip(results, metrics):
+        line, = ax_loss.plot(r["losses"], color=COLORS[r["name"]], linewidth=1.5, label=r["name"])
+        #annotate final loss at the right end
+        final_epoch = len(r["losses"]) - 1
+        final_val = r["losses"][-1]
+        ax_loss.annotate(
+            f'{final_val:.4f}',
+            xy=(final_epoch, final_val),
+            xytext=(final_epoch - len(r["losses"]) * 0.08, final_val * 1.6),
+            color=COLORS[r["name"]], fontsize=7.5, fontweight="bold",
+            arrowprops=dict(arrowstyle="-", color=COLORS[r["name"]],
+                            lw=0.8, alpha=0.6),
+        )
+
+    _style_ax(ax_loss, title="Training Loss per Epoch  (MSE, normalised scale)", xlabel="Epoch", ylabel="MSE (log scale)", fontsize=13)
+    ax_loss.set_yscale("log")
+    ax_loss.legend(facecolor=BG_PANEL, labelcolor="white", fontsize=9, framealpha=0.8, edgecolor=GRID_COL)
+
+    # ---------------------- Row 2 left: RMSE ----------------------
+    rmse_vals = [m["RMSE"] for m in metrics]
+    bars = ax_rmse.bar(names, rmse_vals, color=colors, alpha=0.85, width=0.6)
+    for bar, val in zip(bars, rmse_vals):
+        ax_rmse.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                     f'{val:.3f}°C', ha="center", va="bottom",
+                     color="white", fontsize=8, fontweight="bold")
+    _style_ax(ax_rmse, title="RMSE on Training Set (°C)", ylabel="RMSE (°C)")
+    ax_rmse.set_xticklabels(names, rotation=15, ha="right", color="white", fontsize=8)
+
+    # ---------------------- Row 2 right: MAE ----------------------
+    mae_vals = [m["MAE"] for m in metrics]
+    bars = ax_mae.bar(names, mae_vals, color=colors, alpha=0.85, width=0.6)
+    for bar, val in zip(bars, mae_vals):
+        ax_mae.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                    f'{val:.3f}°C', ha="center", va="bottom",
+                    color="white", fontsize=8, fontweight="bold")
+    _style_ax(ax_mae, title="MAE on Training Set (°C)", ylabel="MAE (°C)")
+    ax_mae.set_xticklabels(names, rotation=15, ha="right", color="white", fontsize=8)
+
+    # ---------------------- Row 3 left: R^2 ----------------------
+    r2_vals = [m["R2"] for m in metrics]
+    bars = ax_r2.bar(names, r2_vals, color=colors, alpha=0.85, width=0.6)
+    for bar, val in zip(bars, r2_vals):
+        ax_r2.text(bar.get_x() + bar.get_width() / 2,
+                   bar.get_height() + 0.002,
+                   f'{val:.4f}', ha="center", va="bottom",
+                   color="white", fontsize=8, fontweight="bold")
+
+    _style_ax(ax_r2, title="R² Score on Training Set  (higher = better)", ylabel="R²")
+    ax_r2.set_xticklabels(names, rotation=15, ha="right", color="white", fontsize=8)
+    ax_r2.set_ylim(0, min(1.05, max(r2_vals) * 1.15))
+
+    # ---------------------- Row 3 right: model spread ----------------------
+    spread = np.std(all_preds, axis=0)
+    ax_spread.bar(range(1, 13), spread, color="#E8834C", alpha=0.85)
+    for i, val in enumerate(spread):
+        ax_spread.text(i + 1, val + 0.01, f'{val:.2f}', ha="center", va="bottom", color="white", fontsize=7)
+
+    _style_ax(ax_spread, title="Model Disagreement – Std Dev Across Models (°C)", ylabel="Std Dev (°C)")
+    ax_spread.set_xticks(range(1, 13))
+    ax_spread.set_xticklabels(MONTHS, fontsize=8, color="white")
+
+    # ---------------------- Row 4: summary metrics table ----------------------
+    ax_table.set_facecolor(BG_PANEL)
+    ax_table.axis("off")
+    ax_table.set_title("Model Metrics Summary", color="white", fontsize=12, pad=10, loc="left")
+
+    col_labels = ["Model", "Final Loss (MSE)", "RMSE (°C)", "MAE(°C)", "R^2"]
+    rows = []
+    for r, m in zip(results, metrics):
+        rows.append([
+            r["name"],
+            f'{m["final_loss"]:.5f}',
+            f'{m["RMSE"]:.3f}',
+            f'{m["MAE"]:.3f}',
+            f'{m["R2"]:.4f}',
+        ])
+
+    tbl = ax_table.table(cellText=rows, colLabels=col_labels, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1, 2.2)
+
+    #style header row
+    for col in range(len(col_labels)):
+        tbl[0, col].set_facecolor("#2C3E6B")
+        tbl[0, col].set_text_props(color="white", fontweight="bold")
+
+    #Style data rows — highlight best value per metric column in green
+    metric_keys  = ["final_loss", "RMSE", "MAE", "R2"]
+    best_is_low  = [True, True, True, False]
+
+    for col_idx, (key, low) in enumerate(zip(metric_keys, best_is_low)):
+        vals = [m[key] for m in metrics]
+        best = min(vals) if low else max(vals)
+        for row_idx, (val, r) in enumerate(zip(vals, results)):
+            cell = tbl[row_idx + 1, col_idx + 1]   # +1 for header and name col
+            is_best = abs(val - best) < 1e-9
+            cell.set_facecolor("#1B3A2B" if is_best else "#1E2235")
+            cell.set_text_props(color="#4CE87A" if is_best else "white",fontweight="bold" if is_best else "normal")
+        # Style name column
+        for row_idx, r in enumerate(results):
+            name_cell = tbl[row_idx + 1, 0]
+            name_cell.set_facecolor("#1E2235")
+            name_cell.set_text_props(color=COLORS[r["name"]], fontweight="bold")
+
+    fig.suptitle("LSTM Family – Monthly Temperature Forecast  |  Karditsa, Greece",
+                 color="white", fontsize=17, fontweight="bold")
+
+    out = "lstm_weather_results.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    print(f"\n  Plot saved → {out}")
+    plt.close()
+
+
+# ----------------|MAIN|----------------
+
+def main():
+    print("=" * 60)
+    print("LSTM Weather Prediction – Karditsa, Greece")
+    print("=" * 60)
+
+    # 1. load the data
+    print("\n[1/3] Loading weather data")
+    daily = load_daily()
+    monthly = build_monthly(daily)
+    X, y, norm_train, mu, sigma = prepare_training_data(monthly)
+    seed_seq = norm_train
+
+    print(f"μ = {mu:.2f} °C   σ = {sigma:.2f} °C   sequences = {len(X)}")
+
+    # 2. train each model — store weights in result for metric computation
+    print("\n[2/3] training models\n")
+    results = []
+    for i, model in enumerate(MODELS, 1):
+        print(f"  [{i}/{len(MODELS)}] {model.NAME}")
+        weights = model.init_weights()
+        losses  = model.train_model(weights, X, y)
+        preds   = model.predict_year_from_weights(weights, seed_seq)
+        result  = {"name": model.NAME, "losses": losses, "preds_2025": preds, "weights": weights}
+        results.append(result)
+        print(f"Final MSE: {losses[-1]:.5f}\n")
+
+    # 3. Compute metrics on training set
+    metrics = [compute_metrics(r, X, y, mu, sigma, mod)
+               for r, mod in zip(results, MODELS)]
+
+    # 4. Print table
+    print("[3/3] 2025 Predictions (°C)\n")
+    names  = [r["name"] for r in results]
+    header = f"{'Month':<6}" + "".join(f"{n:>20}" for n in names)
+    print(header)
+    print("-" * len(header))
+    for i, month in enumerate(MONTHS):
+        row = f"{month:<6}"
+        for r in results:
+            val  = r["preds_2025"][i] * sigma + mu
+            row += f"{val:>20.2f}"
+        print(row)
+
+    print("\nMetrics (training set):\n")
+    print(f"  {'Model':<22}  {'Final MSE':>12}  {'RMSE(°C)':>10}  {'MAE(°C)':>10}  {'R^2':>8}")
+    for r, m in zip(results, metrics):
+        print(f"  {r['name']:<22}  {m['final_loss']:>12.5f}  "
+              f"{m['RMSE']:>10.3f}  {m['MAE']:>10.3f}  {m['R2']:>8.4f}")
+
+    plot_results(results, metrics, monthly, mu, sigma)
+    print("\ndone!")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# --------------------------------------------------------------
+#  train.py  –  training loop, Adam optimiser, and inference
+# --------------------------------------------------------------
+
+import numpy as np
+from tqdm import tqdm
+from config import EPOCHS, LEARNING_RATE, CLIP_GRAD, SEQ_LEN
+
+
+#-------------------------|ADAM STATE|------------------------------------
+
+def make_adam_state(weights: list) -> dict:
+    #initialise first/second moment vectors for every weight array
+    return {
+        "m": [np.zeros_like(w) for w in weights],
+        "v": [np.zeros_like(w) for w in weights],
+        "t": 0,
+    }
+
+
+def adam_step(weights: list, grads: list, state: dict, lr: float = LEARNING_RATE, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8):
+    #in-place Adam update for all weight arrays
+    state["t"] += 1
+    t = state["t"]
+    for i, (w, g) in enumerate(zip(weights, grads)):
+        state["m"][i] = beta1 * state["m"][i] + (1 - beta1) * g
+        state["v"][i] = beta2 * state["v"][i] + (1 - beta2) * g * g
+        m_hat = state["m"][i] / (1 - beta1 ** t)
+        v_hat = state["v"][i] / (1 - beta2 ** t)
+        w -= lr * m_hat / (np.sqrt(v_hat) + eps)
+
+
+def clip_grads(grads: list, max_norm: float = CLIP_GRAD) -> list:
+    #global gradient norm clipping
+    total_norm = np.sqrt(sum(np.sum(g * g) for g in grads))
+    if total_norm > max_norm:
+        scale = max_norm / (total_norm + 1e-8)
+        grads = [g * scale for g in grads]
+    return grads
+
+
+# ----------------------|TRAINING LOOP|-----------------------
+
+def train(forward_and_grad_fn, weights: list,
+          X: np.ndarray, y: np.ndarray, name: str) -> list:
+    """
+    Train using analytical gradients (BPTT) + Adam.
+    Args:
+        forward_and_grad_fn – callable(x, y_true, weights)
+                              returns (loss: float, grads: list[np.ndarray])
+        weights – list of numpy arrays, updated in-place
+        X, y – (N, SEQ_LEN) inputs and (N,) targets
+        name – label shown on the progress bar
+
+    Returns:
+        losses – list of mean MSE per epoch
+    """
+    n     = len(X)
+    state = make_adam_state(weights)
+    losses = []
+
+    bar = tqdm(range(EPOCHS), desc=f"{name:<22}", unit="ep", ncols=88, leave=True)
+
+    for _ in bar:
+        idx = np.random.permutation(n)
+        epoch_loss = 0.0
+
+        for i in idx:
+            loss, grads = forward_and_grad_fn(X[i], y[i], weights)
+            grads = clip_grads(grads)
+            adam_step(weights, grads, state)
+            epoch_loss += loss
+
+        avg = epoch_loss / n
+        losses.append(avg)
+        bar.set_postfix(MSE=f"{avg:.5f}")
+
+    return losses
+
+
+# ------------------|INFERENCE|------------------------
+
+def predict_year(forward_fn, weights: list, seed_seq: np.ndarray) -> list:
+
+    #autoregressively predict 12 months.
+    #seed_seq: normalised training series (uses last SEQ_LEN values as seed).
+
+    buf = list(seed_seq[-SEQ_LEN:])
+    out = []
+    for _ in range(12):
+        x = np.array(buf[-SEQ_LEN:], dtype=np.float64)
+        p = forward_fn(x, weights)
+        out.append(float(p))
+        buf.append(p)
+    return out
+
+# --------------------------------------------------------------
+#  model_lstm.py  –  Classic stacked LSTM  (BPTT)
+# --------------------------------------------------------------
+
+import numpy as np
+from config import HIDDEN_SIZE, NUM_LAYERS, SEED
+from train import train, predict_year
+
+NAME = "Classic LSTM"
+
+def sigmoid(x):
+    x = np.clip(x, -30, 30)
+    return 1.0 / (1.0 + np.exp(-x))
+
+def sigmoid_grad(s): return s * (1.0 - s)   #s already sigmoid(x)
+def tanh_grad(t): return 1.0 - t * t   #t already tanh(x)
+
+
+# --------------------------|WEIGHT HELPERS|----------------------------------
+
+def init_weights() -> list:
+    """
+    Per layer (NUM_LAYERS total):
+      Wi (h, in)  Wf (h, in)  Wg (h, in)  Wo (h, in)
+      Ui (h, h)   Uf (h, h)   Ug (h, h)   Uo (h, h)
+      bi (h,)     bf (h,)     bg (h,)      bo (h,)
+    Output layer:
+      Wy (h,)  by (1,)
+    All arrays are float64 for numerical stability.
+    """
+    rng = np.random.default_rng(SEED)
+    h = HIDDEN_SIZE
+    ws = []
+    for i in range(NUM_LAYERS):
+        d = 1 if i == 0 else h
+        s = np.sqrt(2.0 / (d + h))
+        ws += [
+            rng.normal(0, s, (h, d)),   # Wi
+            rng.normal(0, s, (h, d)),   # Wf
+            rng.normal(0, s, (h, d)),   # Wg
+            rng.normal(0, s, (h, d)),   # Wo
+            rng.normal(0, s, (h, h)),   # Ui
+            rng.normal(0, s, (h, h)),   # Uf
+            rng.normal(0, s, (h, h)),   # Ug
+            rng.normal(0, s, (h, h)),   # Uo
+            np.zeros(h),                # bi
+            np.ones(h),                 # bf  (forget bias = 1)
+            np.zeros(h),                # bg
+            np.zeros(h),                # bo
+        ]
+    ws += [rng.normal(0, 0.1, h), np.zeros(1)]   # Wy, by
+    return [w.astype(np.float64) for w in ws]
+
+
+def _unpack(weights, layer_idx):
+    base = layer_idx * 12
+    return (weights[base],   weights[base+1], weights[base+2],  weights[base+3],
+            weights[base+4], weights[base+5], weights[base+6],  weights[base+7],
+            weights[base+8], weights[base+9], weights[base+10], weights[base+11])
+
+
+# -------------------------------|FORWARD PASS|-------------------------------------
+
+def _lstm_layer_fwd(x_seq, Wi, Wf, Wg, Wo, Ui, Uf, Ug, Uo, bi, bf, bg, bo, h):
+    #run one LSTM layer. Returns lists of gates/states for BPTT.
+    T = len(x_seq)
+    H = [np.zeros(h)]   #h[0] = h_prev at t=0
+    C = [np.zeros(h)]   #c[0] = c_prev at t=0
+    I, F, G, O = [], [], [], []  #gate activations (after nonlinearity)
+
+    for t in range(T):
+        x = x_seq[t] if x_seq.ndim > 1 else x_seq[t:t+1]
+        i_g = sigmoid(Wi @ x + Ui @ H[t] + bi)
+        f_g = sigmoid(Wf @ x + Uf @ H[t] + bf)
+        g_g = np.tanh (Wg @ x + Ug @ H[t] + bg)
+        o_g = sigmoid(Wo @ x + Uo @ H[t] + bo)
+        c = f_g * C[t] + i_g * g_g
+        hh = o_g * np.tanh(c)
+        I.append(i_g); F.append(f_g); G.append(g_g); O.append(o_g)
+        H.append(hh); C.append(c)
+
+    return H, C, I, F, G, O
+
+
+def forward(x_seq: np.ndarray, weights: list) -> float:
+    h = HIDDEN_SIZE
+    seq = x_seq.astype(np.float64)
+    for layer in range(NUM_LAYERS):
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack(weights, layer)
+        H,C,I,F,G,O = _lstm_layer_fwd(seq, Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo, h)
+        seq = np.array(H[1:])     #(T, h) — feed to next layer
+    Wy, by = weights[-2], weights[-1]
+    return float(np.dot(Wy, H[-1]) + by[0])
+
+
+# -------------------------------|BACKWARD PASS|----------------------------------
+
+def forward_and_grad(x_seq: np.ndarray, y_true: float, weights: list):
+    h = HIDDEN_SIZE
+    T = len(x_seq)
+    layers = []
+    seq = x_seq.astype(np.float64)
+
+    #forward through all layers, cache everything
+    for layer in range(NUM_LAYERS):
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack(weights, layer)
+        H,C,I,F,G,O = _lstm_layer_fwd(seq, Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo, h)
+        layers.append((seq, H, C, I, F, G, O))
+        seq = np.array(H[1:])    #output sequence for next layer
+
+    Wy, by = weights[-2], weights[-1]
+    y_pred = float(np.dot(Wy, H[-1]) + by[0])
+    loss = (y_pred - y_true) ** 2
+    d_pred = 2.0 * (y_pred - y_true)   #dL/dy_pred
+
+    #gradients for output layer
+    dWy = d_pred * H[-1]
+    dby = np.array([d_pred])
+    dh_next = d_pred * Wy   #gradient flowing back into last LSTM layer
+
+    all_grads = []
+
+    #backprop through LSTM layers (reverse order)
+    for layer in range(NUM_LAYERS - 1, -1, -1):
+        x_in, H, C, I, F, G, O = layers[layer]
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack(weights, layer)
+
+        dWi=np.zeros_like(Wi); dWf=np.zeros_like(Wf)
+        dWg=np.zeros_like(Wg); dWo=np.zeros_like(Wo)
+        dUi=np.zeros_like(Ui); dUf=np.zeros_like(Uf)
+        dUg=np.zeros_like(Ug); dUo=np.zeros_like(Uo)
+        dbi=np.zeros_like(bi); dbf=np.zeros_like(bf)
+        dbg=np.zeros_like(bg); dbo=np.zeros_like(bo)
+
+        dh = dh_next
+        dc = np.zeros(h)
+        dx_seq = np.zeros_like(x_in)
+
+        for t in range(T - 1, -1, -1):
+            x = x_in[t] if x_in.ndim > 1 else x_in[t:t+1]
+            tanh_c = np.tanh(C[t+1])
+
+            #output gate
+            do = dh * tanh_c
+            do_raw = do * sigmoid_grad(O[t])
+            #cell state
+            dc += dh * O[t] * tanh_grad(tanh_c)
+            #forget gate
+            df = dc * C[t]
+            df_raw = df * sigmoid_grad(F[t])
+            #input gate
+            di = dc * G[t]
+            di_raw = di * sigmoid_grad(I[t])
+            #gate (candidate)
+            dg = dc * I[t]
+            dg_raw = dg * tanh_grad(G[t])
+            #next cell state gradient
+            dc = dc * F[t]
+
+            #accumulate weight gradients
+            dWi += np.outer(di_raw, x)
+            dWf += np.outer(df_raw, x)
+            dWg += np.outer(dg_raw, x)
+            dWo += np.outer(do_raw, x)
+            dUi += np.outer(di_raw, H[t])
+            dUf += np.outer(df_raw, H[t])
+            dUg += np.outer(dg_raw, H[t])
+            dUo += np.outer(do_raw, H[t])
+            dbi += di_raw; dbf += df_raw; dbg += dg_raw; dbo += do_raw
+
+            #gradient to previous hidden state
+            dh = (Ui.T @ di_raw + Uf.T @ df_raw +
+                  Ug.T @ dg_raw + Uo.T @ do_raw)
+
+            #gradient to input (for stacked layers)
+            dx = (Wi.T @ di_raw + Wf.T @ df_raw +
+                  Wg.T @ dg_raw + Wo.T @ do_raw)
+            if x_in.ndim > 1:
+                dx_seq[t] = dx
+            else:
+                dx_seq[t] = dx[0]
+
+        dh_next = dh   #pass gradient to layer below
+
+        #store in reverse so we rebuild in original order at the end
+        all_grads.insert(0, [dWi, dWf, dWg, dWo,
+                              dUi, dUf, dUg, dUo,
+                              dbi, dbf, dbg, dbo])
+
+    #flatten grads in same order as weights
+    flat_grads = []
+    for layer_grads in all_grads:
+        flat_grads.extend(layer_grads)
+    flat_grads += [dWy, dby]
+
+    return loss, flat_grads
+
+
+def run(X: np.ndarray, y: np.ndarray, seed_seq: np.ndarray) -> dict:
+    weights = init_weights()
+    losses = train(forward_and_grad, weights, X, y, NAME)
+    preds = predict_year(forward, weights, seed_seq)
+    return {"name": NAME, "losses": losses, "preds_2025": preds}
+
+# --------------|convenience wrappers used by main.py|--------------------
+from train import train as _train, predict_year as _predict_year
+
+def train_model(weights: list, X, y) -> list:
+    #train in-place and return losses list
+    return _train(forward_and_grad, weights, X, y, NAME)
+
+def predict_year_from_weights(weights: list, seed_seq) -> list:
+    #run autoregressive inference for PREDICT_YEAR
+    return _predict_year(forward, weights, seed_seq)
+
+# --------------------------------------------------------------
+#  model_bilstm.py  –  Bidirectional LSTM  (BPTT)
+# --------------------------------------------------------------
+
+import numpy as np
+from config import HIDDEN_SIZE, NUM_LAYERS, SEED
+from train import train, predict_year
+
+NAME = "Bi-LSTM"
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+def sigmoid_grad(s): return s * (1.0 - s)
+def tanh_grad(t): return 1.0 - t * t
+
+
+def init_weights() -> list:
+    """
+    forward  layers: NUM_LAYERS × 12 arrays  (same layout as model_lstm)
+    backward layers: NUM_LAYERS × 12 arrays
+    output:  Wy (2h,)  by (1,)              (concat fwd+bwd final states)
+    """
+    rng = np.random.default_rng(SEED)
+    h = HIDDEN_SIZE
+    ws = []
+    for _ in range(2):           # two directions
+        for i in range(NUM_LAYERS):
+            d = 1 if i == 0 else h
+            s = np.sqrt(2.0 / (d + h))
+            ws += [
+                rng.normal(0, s, (h, d)),  # Wi
+                rng.normal(0, s, (h, d)),  # Wf
+                rng.normal(0, s, (h, d)),  # Wg
+                rng.normal(0, s, (h, d)),  # Wo
+                rng.normal(0, s, (h, h)),  # Ui
+                rng.normal(0, s, (h, h)),  # Uf
+                rng.normal(0, s, (h, h)),  # Ug
+                rng.normal(0, s, (h, h)),  # Uo
+                np.zeros(h),               # bi
+                np.ones(h),                # bf
+                np.zeros(h),               # bg
+                np.zeros(h),               # bo
+            ]
+    ws += [rng.normal(0, 0.1, 2 * h), np.zeros(1)]   # Wy, by
+    return [w.astype(np.float64) for w in ws]
+
+
+def _unpack(weights, base):
+    return (weights[base],   weights[base+1], weights[base+2],  weights[base+3],
+            weights[base+4], weights[base+5], weights[base+6],  weights[base+7],
+            weights[base+8], weights[base+9], weights[base+10], weights[base+11])
+
+
+def _lstm_fwd(x_seq, Wi, Wf, Wg, Wo, Ui, Uf, Ug, Uo, bi, bf, bg, bo, h):
+    T = len(x_seq)
+    H = [np.zeros(h)]; C = [np.zeros(h)]
+    I, F, G, O = [], [], [], []
+    for t in range(T):
+        x   = x_seq[t] if x_seq.ndim > 1 else x_seq[t:t+1]
+        i_g = sigmoid(Wi @ x + Ui @ H[t] + bi)
+        f_g = sigmoid(Wf @ x + Uf @ H[t] + bf)
+        g_g = np.tanh (Wg @ x + Ug @ H[t] + bg)
+        o_g = sigmoid(Wo @ x + Uo @ H[t] + bo)
+        c   = f_g * C[t] + i_g * g_g
+        hh  = o_g * np.tanh(c)
+        I.append(i_g); F.append(f_g); G.append(g_g); O.append(o_g)
+        H.append(hh); C.append(c)
+    return H, C, I, F, G, O
+
+
+def _lstm_bwd_grads(x_in, H, C, I, F, G, O,
+                    Wi, Wf, Wg, Wo, Ui, Uf, Ug, Uo,
+                    bi, bf, bg, bo, dh_last, h):
+    """BPTT for one LSTM layer. Returns weight grads + dx_seq."""
+    T = len(x_in)
+    dWi=np.zeros_like(Wi); dWf=np.zeros_like(Wf)
+    dWg=np.zeros_like(Wg); dWo=np.zeros_like(Wo)
+    dUi=np.zeros_like(Ui); dUf=np.zeros_like(Uf)
+    dUg=np.zeros_like(Ug); dUo=np.zeros_like(Uo)
+    dbi=np.zeros_like(bi); dbf=np.zeros_like(bf)
+    dbg=np.zeros_like(bg); dbo=np.zeros_like(bo)
+
+    dh  = dh_last
+    dc  = np.zeros(h)
+    dx_seq = np.zeros_like(x_in)
+
+    for t in range(T - 1, -1, -1):
+        x      = x_in[t] if x_in.ndim > 1 else x_in[t:t+1]
+        tanh_c = np.tanh(C[t+1])
+
+        do_raw = (dh * tanh_c) * sigmoid_grad(O[t])
+        dc += (dh * O[t]) * tanh_grad(tanh_c)
+        di_raw = (dc * G[t]) * sigmoid_grad(I[t])
+        df_raw = (dc * C[t]) * sigmoid_grad(F[t])
+        dg_raw = (dc * I[t]) * tanh_grad(G[t])
+        dc = dc * F[t]
+
+        dWi += np.outer(di_raw, x);  dUi += np.outer(di_raw, H[t]); dbi += di_raw
+        dWf += np.outer(df_raw, x);  dUf += np.outer(df_raw, H[t]); dbf += df_raw
+        dWg += np.outer(dg_raw, x);  dUg += np.outer(dg_raw, H[t]); dbg += dg_raw
+        dWo += np.outer(do_raw, x);  dUo += np.outer(do_raw, H[t]); dbo += do_raw
+
+        dh = Ui.T @ di_raw + Uf.T @ df_raw + Ug.T @ dg_raw + Uo.T @ do_raw
+        dx = Wi.T @ di_raw + Wf.T @ df_raw + Wg.T @ dg_raw + Wo.T @ do_raw
+        dx_seq[t] = dx if x_in.ndim > 1 else dx[0]
+
+    w_grads = [dWi,dWf,dWg,dWo, dUi,dUf,dUg,dUo, dbi,dbf,dbg,dbo]
+    return w_grads, dx_seq
+
+
+def forward(x_seq: np.ndarray, weights: list) -> float:
+    h = HIDDEN_SIZE
+    offset = NUM_LAYERS * 12   #where backward layers start
+    seq = x_seq.astype(np.float64)
+
+    # Forward direction
+    fwd_H = None
+    for i in range(NUM_LAYERS):
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack(weights, i*12)
+        fwd_H,_,_,_,_,_ = _lstm_fwd(seq, Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo, h)
+        seq = np.array(fwd_H[1:])
+    h_fwd = fwd_H[-1]
+
+    # Backward direction (reversed sequence)
+    seq = x_seq[::-1].astype(np.float64)
+    bwd_H = None
+    for i in range(NUM_LAYERS):
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack(weights, offset + i*12)
+        bwd_H,_,_,_,_,_ = _lstm_fwd(seq, Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo, h)
+        seq = np.array(bwd_H[1:])
+    h_bwd = bwd_H[-1]
+
+    Wy, by = weights[-2], weights[-1]
+    return float(np.dot(Wy, np.concatenate([h_fwd, h_bwd])) + by[0])
+
+
+def forward_and_grad(x_seq: np.ndarray, y_true: float, weights: list):
+    h = HIDDEN_SIZE
+    offset = NUM_LAYERS * 12
+    seq_f = x_seq.astype(np.float64)
+    seq_b = x_seq[::-1].astype(np.float64)
+
+    # |FORWARD CACHE|------------------------------------------------
+    fwd_cache, bwd_cache = [], []
+
+    for i in range(NUM_LAYERS):
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack(weights, i*12)
+        H,C,I,F,G,O = _lstm_fwd(seq_f, Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo, h)
+        fwd_cache.append((seq_f, H, C, I, F, G, O))
+        seq_f = np.array(H[1:])
+    h_fwd = H[-1]
+
+    for i in range(NUM_LAYERS):
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack(weights, offset + i*12)
+        H,C,I,F,G,O = _lstm_fwd(seq_b, Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo, h)
+        bwd_cache.append((seq_b, H, C, I, F, G, O))
+        seq_b = np.array(H[1:])
+    h_bwd = H[-1]
+
+    Wy, by = weights[-2], weights[-1]
+    y_pred = float(np.dot(Wy, np.concatenate([h_fwd, h_bwd])) + by[0])
+    loss = (y_pred - y_true) ** 2
+    d_pred = 2.0 * (y_pred - y_true)
+
+    dWy = d_pred * np.concatenate([h_fwd, h_bwd])
+    dby = np.array([d_pred])
+    dh_fwd_last = d_pred * Wy[:h]
+    dh_bwd_last = d_pred * Wy[h:]
+
+    # |BACKWARD THROUGH FORWARD LAYERS|---------------------------
+    fwd_layer_grads = []
+    dh = dh_fwd_last
+    for i in range(NUM_LAYERS - 1, -1, -1):
+        x_in,H,C,I,F,G,O = fwd_cache[i]
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack(weights, i*12)
+        lg, _ = _lstm_bwd_grads(x_in, H, C, I, F, G, O,
+                                Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo, bi,bf,bg,bo, dh, h)
+        fwd_layer_grads.insert(0, lg)
+        dh = _
+
+    # |BACKWARD THROUGH BACKWARD LAYERS|--------------------------
+    bwd_layer_grads = []
+    dh = dh_bwd_last
+    for i in range(NUM_LAYERS - 1, -1, -1):
+        x_in,H,C,I,F,G,O = bwd_cache[i]
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack(weights, offset + i*12)
+        lg, _ = _lstm_bwd_grads(x_in, H, C, I, F, G, O,
+                                Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo, bi,bf,bg,bo, dh, h)
+        bwd_layer_grads.insert(0, lg)
+        dh = _
+
+    flat = []
+    for lg in fwd_layer_grads: flat.extend(lg)
+    for lg in bwd_layer_grads: flat.extend(lg)
+    flat += [dWy, dby]
+
+    return loss, flat
+
+
+def run(X: np.ndarray, y: np.ndarray, seed_seq: np.ndarray) -> dict:
+    weights = init_weights()
+    losses  = train(forward_and_grad, weights, X, y, NAME)
+    preds   = predict_year(forward, weights, seed_seq)
+    return {"name": NAME, "losses": losses, "preds_2025": preds}
+
+# ── convenience wrappers used by main.py ─────────────────────
+from train import train as _train, predict_year as _predict_year
+
+def train_model(weights: list, X, y) -> list:
+    """Train in-place and return losses list."""
+    return _train(forward_and_grad, weights, X, y, NAME)
+
+def predict_year_from_weights(weights: list, seed_seq) -> list:
+    """Run autoregressive inference for PREDICT_YEAR."""
+    return _predict_year(forward, weights, seed_seq)
+
+
+# --------------------------------------------------------------
+#  model_attention_lstm.py  –  LSTM + Bahdanau Attention (BPTT)
+#
+#  All hidden states from the final LSTM layer are retained.
+#  Additive attention computes a weighted context vector which
+#  is projected to the scalar prediction.
+# --------------------------------------------------------------
+
+import numpy as np
+from config import HIDDEN_SIZE, NUM_LAYERS, SEED
+from train import train, predict_year
+
+NAME = "LSTM + Attention"
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+def sigmoid_grad(s): return s * (1.0 - s)
+def tanh_grad(t): return 1.0 - t * t
+
+
+def init_weights() -> list:
+    """
+    LSTM layers: NUM_LAYERS × 12 arrays
+    Attention:   Wa (h,h)  va (h,)
+    Output:      Wy (h,)   by (1,)
+    """
+    rng = np.random.default_rng(SEED)
+    h = HIDDEN_SIZE
+    ws = []
+    for i in range(NUM_LAYERS):
+        d = 1 if i == 0 else h
+        s = np.sqrt(2.0 / (d + h))
+        ws += [
+            rng.normal(0, s, (h, d)), rng.normal(0, s, (h, d)),  # Wi Wf
+            rng.normal(0, s, (h, d)), rng.normal(0, s, (h, d)),  # Wg Wo
+            rng.normal(0, s, (h, h)), rng.normal(0, s, (h, h)),  # Ui Uf
+            rng.normal(0, s, (h, h)), rng.normal(0, s, (h, h)),  # Ug Uo
+            np.zeros(h), np.ones(h), np.zeros(h), np.zeros(h),   # bi bf bg bo
+        ]
+    sa = np.sqrt(1.0 / h)
+    ws += [rng.normal(0, sa, (h, h)),   #wa
+           rng.normal(0, sa, h),         #va
+           rng.normal(0, 0.1, h),        #wy
+           np.zeros(1)]   #by
+    return [w.astype(np.float64) for w in ws]
+
+
+def _unpack_lstm(weights, layer_idx):
+    base = layer_idx * 12
+    return (weights[base],   weights[base+1], weights[base+2],  weights[base+3],
+            weights[base+4], weights[base+5], weights[base+6],  weights[base+7],
+            weights[base+8], weights[base+9], weights[base+10], weights[base+11])
+
+
+def _lstm_fwd(x_seq, Wi, Wf, Wg, Wo, Ui, Uf, Ug, Uo, bi, bf, bg, bo, h):
+    T = len(x_seq)
+    H = [np.zeros(h)]; C = [np.zeros(h)]
+    I, F, G, O = [], [], [], []
+    for t in range(T):
+        x   = x_seq[t] if x_seq.ndim > 1 else x_seq[t:t+1]
+        i_g = sigmoid(Wi @ x + Ui @ H[t] + bi)
+        f_g = sigmoid(Wf @ x + Uf @ H[t] + bf)
+        g_g = np.tanh (Wg @ x + Ug @ H[t] + bg)
+        o_g = sigmoid(Wo @ x + Uo @ H[t] + bo)
+        c   = f_g * C[t] + i_g * g_g
+        hh  = o_g * np.tanh(c)
+        I.append(i_g); F.append(f_g); G.append(g_g); O.append(o_g)
+        H.append(hh); C.append(c)
+    return H, C, I, F, G, O
+
+
+def _attention_fwd(H_mat, Wa, va):
+    """
+    H_mat: (T, h)  — all hidden states from last LSTM layer
+    Returns context (h,), alpha (T,), tanh_scores (T, h)
+    """
+    tanh_scores = np.tanh(H_mat @ Wa.T)   #(T, h)
+    scores = tanh_scores @ va   #(T,)
+    scores -= scores.max()
+    alpha = np.exp(scores)
+    alpha /= alpha.sum()
+    context = alpha @ H_mat   #(h,)
+    return context, alpha, tanh_scores
+
+
+def forward(x_seq: np.ndarray, weights: list) -> float:
+    h = HIDDEN_SIZE
+    seq = x_seq.astype(np.float64)
+    for i in range(NUM_LAYERS):
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack_lstm(weights, i)
+        H,C,I,F,G,O = _lstm_fwd(seq, Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo, h)
+        seq = np.array(H[1:])
+
+    attn_end = NUM_LAYERS * 12
+    Wa, va, Wy, by = weights[attn_end], weights[attn_end+1], weights[attn_end+2], weights[attn_end+3]
+    H_mat = np.array(H[1:])   #(T, h)
+    context, _, _ = _attention_fwd(H_mat, Wa, va)
+    return float(np.dot(Wy, context) + by[0])
+
+
+def forward_and_grad(x_seq: np.ndarray, y_true: float, weights: list):
+    h = HIDDEN_SIZE
+    T = len(x_seq)
+    layers = []
+    seq = x_seq.astype(np.float64)
+
+    for i in range(NUM_LAYERS):
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack_lstm(weights, i)
+        H,C,I,F,G,O = _lstm_fwd(seq, Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo, h)
+        layers.append((seq, H, C, I, F, G, O))
+        seq = np.array(H[1:])
+
+    attn_end = NUM_LAYERS * 12
+    Wa = weights[attn_end];   va = weights[attn_end+1]
+    Wy = weights[attn_end+2]; by = weights[attn_end+3]
+
+    H_mat = np.array(H[1:])   #(T, h)
+    context, alpha, tanh_scores = _attention_fwd(H_mat, Wa, va)
+
+    y_pred = float(np.dot(Wy, context) + by[0])
+    loss = (y_pred - y_true) ** 2
+    d_pred = 2.0 * (y_pred - y_true)
+
+    dWy = d_pred * context
+    dby = np.array([d_pred])
+    d_context = d_pred * Wy   #(h,)
+
+    # --------------------|ATTENTION BACKWARD|---------------------------------
+    #context = alpha @ H_mat  →  d_H_mat_attn and d_alpha
+    d_H_attn = alpha[:, None] * d_context[None, :]   #(T, h)
+    d_alpha = H_mat @ d_context   #(T,)
+
+    #alpha = softmax(scores)  →  d_scores
+    d_scores = alpha * (d_alpha - np.dot(alpha, d_alpha))   #(T,)
+
+    #scores = tanh_scores @ va  →  d_va, d_tanh_scores
+    dva = tanh_scores.T @ d_scores   #(h,)
+    d_tanh_scores = np.outer(d_scores, va)   #(T, h)
+
+    #tanh_scores = tanh(H_mat @ Wa.T)  →  dWa, d_H_mat_wa
+    d_inner = d_tanh_scores * (1.0 - tanh_scores ** 2)   #(T, h)
+    dWa = d_inner.T @ H_mat   #(h, h)
+    d_H_wa = d_inner @ Wa   #(T, h)  ← grad through Wa
+
+    #total gradient into H_mat from attention
+    d_H_mat = d_H_attn + d_H_wa   #(T, h)
+
+    # |LSTM BPTT|----------------------------------------------------
+    #d_H_mat gives gradient at each timestep's hidden state
+    all_grads = []
+    dh_next = np.zeros(h)   #no gradient from beyond last layer
+
+    for i in range(NUM_LAYERS - 1, -1, -1):
+        x_in, H, C, I, F, G, O = layers[i]
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack_lstm(weights, i)
+
+        dWi=np.zeros_like(Wi); dWf=np.zeros_like(Wf)
+        dWg=np.zeros_like(Wg); dWo=np.zeros_like(Wo)
+        dUi=np.zeros_like(Ui); dUf=np.zeros_like(Uf)
+        dUg=np.zeros_like(Ug); dUo=np.zeros_like(Uo)
+        dbi=np.zeros_like(bi); dbf=np.zeros_like(bf)
+        dbg=np.zeros_like(bg); dbo=np.zeros_like(bo)
+        dx_seq = np.zeros_like(x_in)
+
+        dh = dh_next
+        dc = np.zeros(h)
+
+        for t in range(T - 1, -1, -1):
+            x = x_in[t] if x_in.ndim > 1 else x_in[t:t+1]
+            tanh_c = np.tanh(C[t+1])
+
+            #add attention gradient at this timestep (only for last LSTM layer)
+            if i == NUM_LAYERS - 1:
+                dh = dh + d_H_mat[t]
+
+            do_raw = dh * tanh_c * sigmoid_grad(O[t])
+            dc += dh * O[t] * tanh_grad(tanh_c)
+            di_raw = dc * G[t] * sigmoid_grad(I[t])
+            df_raw = dc * C[t] * sigmoid_grad(F[t])
+            dg_raw = dc * I[t] * tanh_grad(G[t])
+            dc = dc * F[t]
+
+            dWi += np.outer(di_raw, x); dUi += np.outer(di_raw, H[t]); dbi += di_raw
+            dWf += np.outer(df_raw, x); dUf += np.outer(df_raw, H[t]); dbf += df_raw
+            dWg += np.outer(dg_raw, x); dUg += np.outer(dg_raw, H[t]); dbg += dg_raw
+            dWo += np.outer(do_raw, x); dUo += np.outer(do_raw, H[t]); dbo += do_raw
+
+            dh = Ui.T@di_raw + Uf.T@df_raw + Ug.T@dg_raw + Uo.T@do_raw
+            dx = Wi.T@di_raw + Wf.T@df_raw + Wg.T@dg_raw + Wo.T@do_raw
+            dx_seq[t] = dx if x_in.ndim > 1 else dx[0]
+
+        all_grads.insert(0, [dWi,dWf,dWg,dWo, dUi,dUf,dUg,dUo, dbi,dbf,dbg,dbo])
+        dh_next = dh
+
+    flat = []
+    for lg in all_grads: flat.extend(lg)
+    flat += [dWa, dva, dWy, dby]
+    return loss, flat
+
+
+def run(X: np.ndarray, y: np.ndarray, seed_seq: np.ndarray) -> dict:
+    weights = init_weights()
+    losses  = train(forward_and_grad, weights, X, y, NAME)
+    preds   = predict_year(forward, weights, seed_seq)
+    return {"name": NAME, "losses": losses, "preds_2025": preds}
+
+# --------------------|CONVENIENCE WRAPPERS|-----------------------------------------
+from train import train as _train, predict_year as _predict_year
+
+def train_model(weights: list, X, y) -> list:
+    #train in-place and return losses list
+    return _train(forward_and_grad, weights, X, y, NAME)
+
+def predict_year_from_weights(weights: list, seed_seq) -> list:
+    #run autoregressive inference for PREDICT_YEAR
+    return _predict_year(forward, weights, seed_seq)
+
+
+# --------------------------------------------------------------
+#  model_convlstm.py  –  Conv1D → LSTM  (BPTT)
+#
+#  A single 1-D conv filter (kernel=3) extracts local temporal
+#  patterns from the input, then feeds into a stacked LSTM.
+# --------------------------------------------------------------
+
+import numpy as np
+from config import HIDDEN_SIZE, NUM_LAYERS, SEED
+from train import train, predict_year
+
+NAME = "ConvLSTM"
+CONV_K = 3
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+def sigmoid_grad(s): return s * (1.0 - s)
+def tanh_grad(t): return 1.0 - t * t
+
+
+def init_weights() -> list:
+    """
+    [Wc (CONV_K,)  bc (1,)
+     LSTM layer 0 (12 arrays) ... LSTM layer N
+     Wy (h,)  by (1,)]
+    """
+    rng = np.random.default_rng(SEED)
+    h = HIDDEN_SIZE
+    ws = [rng.normal(0, 0.1, CONV_K), np.zeros(1)]   #conv
+    for i in range(NUM_LAYERS):
+        d = 1 if i == 0 else h
+        s = np.sqrt(2.0 / (d + h))
+        ws += [
+            rng.normal(0, s, (h, d)), rng.normal(0, s, (h, d)),  # Wi Wf
+            rng.normal(0, s, (h, d)), rng.normal(0, s, (h, d)),  # Wg Wo
+            rng.normal(0, s, (h, h)), rng.normal(0, s, (h, h)),  # Ui Uf
+            rng.normal(0, s, (h, h)), rng.normal(0, s, (h, h)),  # Ug Uo
+            np.zeros(h), np.ones(h), np.zeros(h), np.zeros(h),   # bi bf bg bo
+        ]
+    ws += [rng.normal(0, 0.1, h), np.zeros(1)]
+    return [w.astype(np.float64) for w in ws]
+
+
+def _unpack_lstm(weights, layer_idx):
+    base = 2 + layer_idx * 12   # skip Wc, bc
+    return (weights[base],   weights[base+1], weights[base+2],  weights[base+3],
+            weights[base+4], weights[base+5], weights[base+6],  weights[base+7],
+            weights[base+8], weights[base+9], weights[base+10], weights[base+11])
+
+
+def _conv1d_fwd(x_seq, Wc, bc):
+    #same-pad 1-D conv, single filter. Returns (T,) output + padded input
+    T = len(x_seq)
+    pad = CONV_K // 2
+    padded = np.pad(x_seq, pad)
+    out = np.array([np.dot(Wc, padded[t:t+CONV_K]) + bc[0] for t in range(T)])
+    return out, padded
+
+
+def _conv1d_bwd(d_out, padded, Wc):
+    #backprop through same-pad conv1d
+    T = len(d_out)
+    dWc = np.zeros_like(Wc)
+    dbc = np.array([d_out.sum()])
+    d_pad = np.zeros_like(padded)
+    pad = CONV_K // 2
+    for t in range(T):
+        dWc += d_out[t] * padded[t:t+CONV_K]
+        d_pad[t:t+CONV_K] += d_out[t] * Wc
+    d_x = d_pad[pad:pad+T]
+    return dWc, dbc, d_x
+
+
+def _lstm_fwd(x_seq, Wi, Wf, Wg, Wo, Ui, Uf, Ug, Uo, bi, bf, bg, bo, h):
+    T = len(x_seq)
+    H = [np.zeros(h)]; C = [np.zeros(h)]
+    I, F, G, O = [], [], [], []
+    for t in range(T):
+        x = x_seq[t:t+1] if x_seq.ndim == 1 else x_seq[t]
+        i_g = sigmoid(Wi @ x + Ui @ H[t] + bi)
+        f_g = sigmoid(Wf @ x + Uf @ H[t] + bf)
+        g_g = np.tanh (Wg @ x + Ug @ H[t] + bg)
+        o_g = sigmoid(Wo @ x + Uo @ H[t] + bo)
+        c = f_g * C[t] + i_g * g_g
+        hh = o_g * np.tanh(c)
+        I.append(i_g); F.append(f_g); G.append(g_g); O.append(o_g)
+        H.append(hh); C.append(c)
+    return H, C, I, F, G, O
+
+
+def _lstm_bwd(x_in, H, C, I, F, G, O,
+              Wi, Wf, Wg, Wo, Ui, Uf, Ug, Uo,
+              bi, bf, bg, bo, dh_last, h):
+    T = len(x_in)
+    dWi=np.zeros_like(Wi); dWf=np.zeros_like(Wf)
+    dWg=np.zeros_like(Wg); dWo=np.zeros_like(Wo)
+    dUi=np.zeros_like(Ui); dUf=np.zeros_like(Uf)
+    dUg=np.zeros_like(Ug); dUo=np.zeros_like(Uo)
+    dbi=np.zeros_like(bi); dbf=np.zeros_like(bf)
+    dbg=np.zeros_like(bg); dbo=np.zeros_like(bo)
+    dh = dh_last; dc = np.zeros(h)
+    dx_seq = np.zeros(T)
+
+    for t in range(T - 1, -1, -1):
+        x = x_in[t:t+1] if x_in.ndim == 1 else x_in[t]
+        tanh_c = np.tanh(C[t+1])
+        do_raw = dh * tanh_c * sigmoid_grad(O[t])
+        dc += dh * O[t] * tanh_grad(tanh_c)
+        di_raw = dc * G[t] * sigmoid_grad(I[t])
+        df_raw = dc * C[t] * sigmoid_grad(F[t])
+        dg_raw = dc * I[t] * tanh_grad(G[t])
+        dc = dc * F[t]
+
+        dWi += np.outer(di_raw, x); dUi += np.outer(di_raw, H[t]); dbi += di_raw
+        dWf += np.outer(df_raw, x); dUf += np.outer(df_raw, H[t]); dbf += df_raw
+        dWg += np.outer(dg_raw, x); dUg += np.outer(dg_raw, H[t]); dbg += dg_raw
+        dWo += np.outer(do_raw, x); dUo += np.outer(do_raw, H[t]); dbo += do_raw
+
+        dh = Ui.T@di_raw + Uf.T@df_raw + Ug.T@dg_raw + Uo.T@do_raw
+        dx = Wi.T@di_raw + Wf.T@df_raw + Wg.T@dg_raw + Wo.T@do_raw
+        dx_seq[t] = dx[0]   # conv output is always 1-feature per step
+
+    return [dWi,dWf,dWg,dWo, dUi,dUf,dUg,dUo, dbi,dbf,dbg,dbo], dx_seq
+
+
+def forward(x_seq: np.ndarray, weights: list) -> float:
+    Wc, bc = weights[0], weights[1]
+    conv_out, _ = _conv1d_fwd(x_seq.astype(np.float64), Wc, bc)
+    h = HIDDEN_SIZE
+    seq = conv_out
+    for i in range(NUM_LAYERS):
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack_lstm(weights, i)
+        H,C,I,F,G,O = _lstm_fwd(seq, Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo, h)
+        seq = np.array(H[1:])
+    Wy, by = weights[-2], weights[-1]
+    return float(np.dot(Wy, H[-1]) + by[0])
+
+
+def forward_and_grad(x_seq: np.ndarray, y_true: float, weights: list):
+    h = HIDDEN_SIZE
+    Wc, bc = weights[0], weights[1]
+    conv_out, padded = _conv1d_fwd(x_seq.astype(np.float64), Wc, bc)
+
+    layers = []
+    seq    = conv_out
+    for i in range(NUM_LAYERS):
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack_lstm(weights, i)
+        H,C,I,F,G,O = _lstm_fwd(seq, Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo, h)
+        layers.append((seq, H, C, I, F, G, O))
+        seq = np.array(H[1:])
+
+    Wy, by = weights[-2], weights[-1]
+    y_pred = float(np.dot(Wy, H[-1]) + by[0])
+    loss = (y_pred - y_true) ** 2
+    d_pred = 2.0 * (y_pred - y_true)
+
+    dWy = d_pred * H[-1]
+    dby = np.array([d_pred])
+    dh  = d_pred * Wy
+
+    lstm_grads = []
+    d_conv_out = None  #gradient into conv layer
+    for i in range(NUM_LAYERS - 1, -1, -1):
+        x_in,H,C,I,F,G,O = layers[i]
+        Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo,bi,bf,bg,bo = _unpack_lstm(weights, i)
+        lg, dx = _lstm_bwd(x_in, H, C, I, F, G, O,
+                           Wi,Wf,Wg,Wo,Ui,Uf,Ug,Uo, bi,bf,bg,bo, dh, h)
+        lstm_grads.insert(0, lg)
+        dh = dx if i > 0 else None
+        if i == 0:
+            d_conv_out = dx   #gradient into conv layer
+
+    dWc, dbc, _ = _conv1d_bwd(d_conv_out, padded, Wc)
+
+    flat = [dWc, dbc]
+    for lg in lstm_grads: flat.extend(lg)
+    flat += [dWy, dby]
+    return loss, flat
+
+
+def run(X: np.ndarray, y: np.ndarray, seed_seq: np.ndarray) -> dict:
+    weights = init_weights()
+    losses  = train(forward_and_grad, weights, X, y, NAME)
+    preds   = predict_year(forward, weights, seed_seq)
+    return {"name": NAME, "losses": losses, "preds_2025": preds}
+
+# --------------------|CONVENIENCE WRAPPERS|-----------------------------------------
+from train import train as _train, predict_year as _predict_year
+
+def train_model(weights: list, X, y) -> list:
+    #train in-place and return losses list
+    return _train(forward_and_grad, weights, X, y, NAME)
+
+def predict_year_from_weights(weights: list, seed_seq) -> list:
+    #run autoregressive inference for PREDICT_YEAR
+    return _predict_year(forward, weights, seed_seq)
+
+# --------------------------------------------------------------
+#  model_gru.py  –  Gated Recurrent Unit  (BPTT)
+# --------------------------------------------------------------
+
+import numpy as np
+from config import HIDDEN_SIZE, NUM_LAYERS, SEED
+from train import train, predict_year
+
+NAME = "GRU"
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+def sigmoid_grad(s): return s * (1.0 - s)
+def tanh_grad(t): return 1.0 - t * t
+
+
+def init_weights() -> list:
+    """
+    Per layer: Wz Wr Wn (h,d)  Uz Ur Un (h,h)  bz br bn (h,)  — 9 arrays
+    Output:    Wy (h,)  by (1,)
+    """
+    rng = np.random.default_rng(SEED)
+    h = HIDDEN_SIZE
+    ws = []
+    for i in range(NUM_LAYERS):
+        d = 1 if i == 0 else h
+        s = np.sqrt(2.0 / (d + h))
+        ws += [
+            rng.normal(0, s, (h, d)),  # Wz
+            rng.normal(0, s, (h, d)),  # Wr
+            rng.normal(0, s, (h, d)),  # Wn
+            rng.normal(0, s, (h, h)),  # Uz
+            rng.normal(0, s, (h, h)),  # Ur
+            rng.normal(0, s, (h, h)),  # Un
+            np.zeros(h),               # bz
+            np.zeros(h),               # br
+            np.zeros(h),               # bn
+        ]
+    ws += [rng.normal(0, 0.1, h), np.zeros(1)]
+    return [w.astype(np.float64) for w in ws]
+
+
+def _unpack(weights, layer_idx):
+    b = layer_idx * 9
+    return (weights[b], weights[b+1], weights[b+2],
+            weights[b+3], weights[b+4], weights[b+5],
+            weights[b+6], weights[b+7], weights[b+8])
+
+
+def _gru_fwd(x_seq, Wz, Wr, Wn, Uz, Ur, Un, bz, br, bn, h):
+    T = len(x_seq)
+    H = [np.zeros(h)]
+    Z, R, N = [], [], []
+    for t in range(T):
+        x = x_seq[t] if x_seq.ndim > 1 else x_seq[t:t+1]
+        z = sigmoid(Wz @ x + Uz @ H[t] + bz)
+        r = sigmoid(Wr @ x + Ur @ H[t] + br)
+        n = np.tanh (Wn @ x + Un @ (r * H[t]) + bn)
+        hh = (1.0 - z) * H[t] + z * n
+        Z.append(z); R.append(r); N.append(n); H.append(hh)
+    return H, Z, R, N
+
+
+def forward(x_seq: np.ndarray, weights: list) -> float:
+    h = HIDDEN_SIZE
+    seq = x_seq.astype(np.float64)
+    for i in range(NUM_LAYERS):
+        Wz,Wr,Wn,Uz,Ur,Un,bz,br,bn = _unpack(weights, i)
+        H,Z,R,N = _gru_fwd(seq, Wz,Wr,Wn,Uz,Ur,Un,bz,br,bn, h)
+        seq = np.array(H[1:])
+    Wy, by = weights[-2], weights[-1]
+    return float(np.dot(Wy, H[-1]) + by[0])
+
+
+def forward_and_grad(x_seq: np.ndarray, y_true: float, weights: list):
+    h = HIDDEN_SIZE
+    T = len(x_seq)
+    layers = []
+    seq = x_seq.astype(np.float64)
+
+    for i in range(NUM_LAYERS):
+        Wz,Wr,Wn,Uz,Ur,Un,bz,br,bn = _unpack(weights, i)
+        H,Z,R,N = _gru_fwd(seq, Wz,Wr,Wn,Uz,Ur,Un,bz,br,bn, h)
+        layers.append((seq, H, Z, R, N))
+        seq = np.array(H[1:])
+
+    Wy, by = weights[-2], weights[-1]
+    y_pred = float(np.dot(Wy, H[-1]) + by[0])
+    loss = (y_pred - y_true) ** 2
+    d_pred = 2.0 * (y_pred - y_true)
+
+    dWy = d_pred * H[-1]
+    dby = np.array([d_pred])
+    dh = d_pred * Wy
+
+    all_grads = []
+    for i in range(NUM_LAYERS - 1, -1, -1):
+        x_in, H, Z, R, N = layers[i]
+        Wz,Wr,Wn,Uz,Ur,Un,bz,br,bn = _unpack(weights, i)
+
+        dWz=np.zeros_like(Wz); dWr=np.zeros_like(Wr); dWn=np.zeros_like(Wn)
+        dUz=np.zeros_like(Uz); dUr=np.zeros_like(Ur); dUn=np.zeros_like(Un)
+        dbz=np.zeros_like(bz); dbr=np.zeros_like(br); dbn=np.zeros_like(bn)
+        dx_seq = np.zeros_like(x_in)
+
+        for t in range(T - 1, -1, -1):
+            x = x_in[t] if x_in.ndim > 1 else x_in[t:t+1]
+
+            # h = (1-z)*h_prev + z*n
+            dn     = dh * Z[t]         * tanh_grad(N[t])
+            dz_raw = dh * (N[t] - H[t]) * sigmoid_grad(Z[t])
+            dh_prev = dh * (1.0 - Z[t])
+
+            # n = tanh(Wn@x + Un@(r*h_prev) + bn)
+            dr_h   = Un.T @ dn
+            dr_raw = dr_h * H[t] * sigmoid_grad(R[t])
+            dh_prev += dr_h * R[t]
+
+            dWz += np.outer(dz_raw, x); dUz += np.outer(dz_raw, H[t]); dbz += dz_raw
+            dWr += np.outer(dr_raw, x); dUr += np.outer(dr_raw, H[t]); dbr += dr_raw
+            dWn += np.outer(dn, x);     dUn += np.outer(dn, R[t] * H[t]); dbn += dn
+            dh_prev += Uz.T @ dz_raw + Ur.T @ dr_raw
+
+            dx = Wz.T @ dz_raw + Wr.T @ dr_raw + Wn.T @ dn
+            dx_seq[t] = dx if x_in.ndim > 1 else dx[0]
+            dh = dh_prev
+
+        all_grads.insert(0, [dWz,dWr,dWn, dUz,dUr,dUn, dbz,dbr,dbn])
+
+    flat = []
+    for lg in all_grads: flat.extend(lg)
+    flat += [dWy, dby]
+    return loss, flat
+
+
+def run(X: np.ndarray, y: np.ndarray, seed_seq: np.ndarray) -> dict:
+    weights = init_weights()
+    losses  = train(forward_and_grad, weights, X, y, NAME)
+    preds   = predict_year(forward, weights, seed_seq)
+    return {"name": NAME, "losses": losses, "preds_2025": preds}
+
+# --------------------|CONVENIENCE WRAPPERS|-----------------------------------
+from train import train as _train, predict_year as _predict_year
+
+def train_model(weights: list, X, y) -> list:
+    #train in-place and return losses list
+    return _train(forward_and_grad, weights, X, y, NAME)
+
+def predict_year_from_weights(weights: list, seed_seq) -> list:
+    #run autoregressive inference for PREDICT_YEAR
+    return _predict_year(forward, weights, seed_seq)
