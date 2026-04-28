@@ -515,13 +515,13 @@ Narrowing the age gap between domains makes the task *harder* — the discrimina
 
 Shows the model's translations after 50 epochs of training. Each column is a different face from the validation set.
 
-![Epoch 50 Sample Grid](file:///c:/Users/akoukosias/Documents/GitHub/Advanced-Machine-Learning-Techniques/epoch_050.png)
+![Epoch 50 Sample Grid](epoch_050.png)
 
 ### Training Loss Curves
 
 The loss history across all 50 epochs. Stable, converging curves indicate healthy GAN training.
 
-![Loss Curves](file:///c:/Users/akoukosias/Documents/GitHub/Advanced-Machine-Learning-Techniques/loss_curves.png)
+![Loss Curves](loss_curves.png)
 
 ---
 
