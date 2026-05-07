@@ -142,20 +142,89 @@ YOLOv8 + ByteTrack        -> car detection and tracking
 MobileNetV3-Small         -> brand classification from car crops
 ```
 
-The full pipeline is:
+### Video Pipeline Diagram
 
-```text
-local mp4 video
-  -> read frame with OpenCV
-  -> detect cars with YOLOv8
-  -> assign stable track ids with ByteTrack
-  -> crop each detected car
-  -> classify crop with MobileNetV3-Small
-  -> accumulate brand confidence per track
-  -> draw box, id, brand, probability
-  -> write annotated frame to output video
-  -> export final brand counts to JSON
+```mermaid
+flowchart LR
+  subgraph input[input]
+    video["video file<br/>traffic.mp4"]
+    sampler["frame sampler<br/>FRAME_SKIP, ROI filter"]
+    detector["YOLOv8n detector<br/>YOLO_CONF=0.4, class 2"]
+    tracker["ByteTrack<br/>assigns track ids"]
+  end
+
+  subgraph classify[classify]
+    crop["crop extractor<br/>MIN_CROP=50 px guard"]
+    tfm["transforms<br/>resize, normalize"]
+    clf["MobileNetV3-Small<br/>fine-tuned brand head"]
+    vote["vote aggregator<br/>confidence scores per track"]
+  end
+
+  subgraph output[output]
+    annotate["frame annotator<br/>boxes, labels, count panel"]
+    writer["MP4 writer<br/>annotated.mp4"]
+    json["JSON export<br/>counts + track brands"]
+  end
+
+  video --> sampler --> detector --> tracker
+  tracker --> crop --> tfm --> clf --> vote
+  vote --> annotate --> writer --> json
 ```
+
+### Training Diagram
+
+```mermaid
+flowchart LR
+  dataset["dataset<br/>train/ + test/ folders"]
+  aug["augmentation<br/>crop, flip, color jitter<br/>normalize ImageNet"]
+  epoch["training epoch<br/>forward -> CE loss<br/>backward -> AdamW<br/>LR 3e-4, wd 1e-4"]
+  val["validation<br/>test accuracy per epoch"]
+  best["best checkpoint<br/>brand_classifier.pth"]
+  resume["resume state<br/>training_state.pth"]
+
+  dataset --> aug --> epoch --> val --> best
+  epoch --> resume
+  resume -.->|load_classifier| epoch
+  aug -.->|8 epochs| epoch
+```
+
+### Component Choices
+
+`YOLOv8n` is the nano YOLOv8 detector. It is used because speed matters more than maximum detector accuracy in this project. It can run quickly on video frames, even without a GPU, and cars are usually large enough in traffic footage that the lightweight detector is a good fit.
+
+`ByteTrack` is used instead of simple frame-by-frame detection counting because it keeps stable ids for cars over time. If a car is briefly occluded by another vehicle, the tracker can reconnect the detection to the same track id instead of counting it again.
+
+`MobileNetV3-Small` is a compact CNN designed for mobile and edge inference. The model starts from ImageNet pretrained weights, then the final classifier layer is replaced with a new linear layer whose output size equals the number of car brands. This is transfer learning: the pretrained visual features already know useful edges, shapes, textures, and object parts, so the project needs less brand-labeled data than training a CNN from scratch.
+
+The current implementation fine-tunes all MobileNetV3-Small parameters after replacing the head. If faster training is preferred over maximum adaptation, the backbone can be frozen and only the final linear head can be trained.
+
+`AdamW` is used with:
+
+```python
+LR = 3e-4
+weight_decay = 1e-4
+```
+
+This is a reliable default for fine-tuning pretrained vision models. The learning rate is high enough for the classifier to adapt, while weight decay helps reduce overfitting.
+
+`YOLO_CONF = 0.4` is a middle-ground detection threshold. Lower values can add false positives, while higher values can miss partially occluded vehicles. For counting, `0.4` leans toward recall so fewer cars are missed.
+
+`IMG_SIZE = 224` matches the standard input size used by MobileNetV3 ImageNet training. Keeping the same size and normalization makes the pretrained features behave as expected.
+
+`FRAME_SKIP = 1` means every frame is processed. Increase it to `2`, `3`, or `5` if the machine is slow and speed is more important than maximum tracking precision.
+
+`MIN_CROP = 50` discards very small boxes. Crops below roughly `50x50` pixels do not contain enough visual detail for reliable brand classification.
+
+`BATCH_SIZE = 32` and `EPOCHS = 8` are conservative defaults for a fine-tuning job. A batch size of 32 is usually stable, and 8 epochs gives the pretrained network time to adapt without making the first run unnecessarily long.
+
+ImageNet mean/std normalization is required because the MobileNet backbone was pretrained with that input distribution:
+
+```python
+MEAN = [0.485, 0.456, 0.406]
+STD = [0.229, 0.224, 0.225]
+```
+
+Using different normalization would degrade the value of the pretrained weights.
 
 ### Dataset Preparation
 
