@@ -39,6 +39,7 @@ data/
 big_data/
 small_data/
 dataset/
+60k-car-dataset/
 
 # ---- OS ----
 .DS_Store
