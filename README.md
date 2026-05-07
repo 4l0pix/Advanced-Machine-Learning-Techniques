@@ -395,3 +395,6 @@ If you change the dataset brands, delete old checkpoints before retraining:
 ```bash
 rm models/brand_classifier.pth models/training_state.pth
 ```
+## Important Links
+https://datature.io/blog/introduction-to-bytetrack-multi-object-tracking-by-associating-every-detection-box
+https://docs.pytorch.org/vision/main/models/generated/torchvision.models.mobilenet_v3_small.html
