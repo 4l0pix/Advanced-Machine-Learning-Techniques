@@ -1,3 +1,8 @@
+#--------------------------------------------------------------
+#KOUKOSIAS ATHANASIOS 2025-2026 UTH
+# Results at:https://github.com/4l0pix/Advanced-Machine-Learning-Techniques/blob/trafic-cam-tracker/
+#--------------------------------------------------------------
+
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
