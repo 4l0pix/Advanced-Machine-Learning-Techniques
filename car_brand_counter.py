@@ -21,7 +21,7 @@ MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 #paths
 DATA_DIR = "grouped-cars/"
-VIDEO_PATH = "traffic.mp4"
+VIDEO_PATH = "samples-videos/traffic2.mp4"
 OUTPUT_VIDEO = "outputs/annotated.mp4"
 CKPT_PATH = "models/brand_classifier.pth"
 TRAIN_STATE_PATH = "models/training_state.pth"
