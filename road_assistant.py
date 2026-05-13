@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+#imports
 import argparse
 import csv
 import random
@@ -19,6 +20,7 @@ from ultralytics import YOLO
 from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
 
 
+#gtsrb id to label map
 GTSRB_LABELS = {
     0: "speed_limit_20",
     1: "speed_limit_30",
@@ -66,6 +68,7 @@ GTSRB_LABELS = {
     43: "not_traffic_sign",
 }
 
+#labels ignored so false detections do not become signs
 NON_SIGN_LABELS = {
     "person",
     "pedestrian",
@@ -91,6 +94,7 @@ NON_SIGN_LABELS = {
     "plate",
 }
 
+#standard transform for sign crops
 SIGN_TF = transforms.Compose(
     [
         transforms.Resize((64, 64)),
@@ -100,10 +104,12 @@ SIGN_TF = transforms.Compose(
 )
 
 
+#select gpu when available
 def device_name():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+#find first file matching patterns
 def first_match(root, patterns):
     root = Path(root)
     if not root.exists():
@@ -115,6 +121,7 @@ def first_match(root, patterns):
     return None
 
 
+#convert sign label to driver instruction
 def message_for_sign(label, urgency="normal"):
     label = str(label).lower().replace(" ", "_")
     if label == "not_traffic_sign":
@@ -155,11 +162,13 @@ def message_for_sign(label, urgency="normal"):
     return f"Traffic sign detected: {label.replace('_', ' ')}. Please pay attention."
 
 
+#reject non traffic labels from custom detectors
 def is_probable_sign_label(label):
     normalized = str(label).lower().strip().replace("-", " ").replace("_", " ")
     return normalized not in NON_SIGN_LABELS
 
 
+#load gtsrb images from csv or folders
 class GTSRBDataset(Dataset):
     def __init__(self, root, split="Train", image_size=64, train=True):
         self.root = Path(root)
@@ -214,6 +223,7 @@ class GTSRBDataset(Dataset):
         return self.tf(img), label
 
 
+#build background crops for the not traffic sign class
 class NegativeCropDataset(Dataset):
     def __init__(self, cityscapes_root, count=12000, image_size=64, train=True):
         self.root = Path(cityscapes_root)
@@ -253,6 +263,7 @@ class NegativeCropDataset(Dataset):
         return self.tf(crop), self.label
 
 
+#compact cnn used to classify gtsrb sign crops
 class SmallGTSRBCNN(nn.Module):
     def __init__(self, num_classes=44):
         super().__init__()
@@ -282,6 +293,7 @@ class SmallGTSRBCNN(nn.Module):
         return self.net(x)
 
 
+#combine gtsrb signs and cityscapes negative crops
 def make_classifier_loaders(gtsrb_root, cityscapes_root, val_fraction=0.15, batch_size=128, negative_count=12000):
     sign_dataset = GTSRBDataset(gtsrb_root, split="Train", train=True)
     if len(sign_dataset) == 0:
@@ -303,6 +315,7 @@ def make_classifier_loaders(gtsrb_root, cityscapes_root, val_fraction=0.15, batc
 
 
 @torch.no_grad()
+#measure validation accuracy and negative class accuracy
 def evaluate_classifier(model, loader, device):
     model.eval()
     correct, total = 0, 0
@@ -319,6 +332,7 @@ def evaluate_classifier(model, loader, device):
     return correct / max(1, total), negative_correct / max(1, negative_total)
 
 
+#train the 44 class sign classifier and save best checkpoint
 def train_gtsrb_classifier(gtsrb_root, cityscapes_root, output_path, epochs=20, batch_size=128, negative_count=12000):
     device = device_name()
     train_loader, val_loader = make_classifier_loaders(gtsrb_root, cityscapes_root, batch_size=batch_size, negative_count=negative_count)
@@ -359,6 +373,7 @@ def train_gtsrb_classifier(gtsrb_root, cityscapes_root, output_path, epochs=20, 
     return model
 
 
+#load new or legacy gtsrb classifier checkpoint
 def load_gtsrb_classifier(path):
     path = Path(path)
     if not path.exists():
@@ -377,6 +392,7 @@ def load_gtsrb_classifier(path):
     return model
 
 
+#wrap cityscapes segformer road and sidewalk segmentation
 class RoadSegmenter:
     def __init__(self, model_name_or_path):
         device = device_name()
@@ -402,6 +418,7 @@ class RoadSegmenter:
         return road, sidewalk
 
 
+#estimate driving corridor width at frame height
 def driving_corridor_bounds(y, h, w, horizon=0.45, top_width=0.18, bottom_width=0.78):
     horizon_y = h * horizon
     if y <= horizon_y:
@@ -413,6 +430,7 @@ def driving_corridor_bounds(y, h, w, horizon=0.45, top_width=0.18, bottom_width=
     return int(w / 2 - half), int(w / 2 + half)
 
 
+#decide if person base is on road and not on the sidewalk
 def is_pedestrian_dangerous(box, road_mask, sidewalk_mask, frame_shape, args):
     h, w = frame_shape[:2]
     x1, y1, x2, y2 = [int(v) for v in box]
@@ -437,6 +455,7 @@ def is_pedestrian_dangerous(box, road_mask, sidewalk_mask, frame_shape, args):
     return bool(on_street and not clearly_sidewalk and corridor_ok), road_overlap, sidewalk_overlap
 
 
+#find possible traffic sign regions from red blue yellow colors
 def sign_candidates_by_color(frame_bgr, args):
     min_area = int(frame_bgr.shape[0] * frame_bgr.shape[1] * args.sign_proposal_min_area_ratio)
     max_area = int(frame_bgr.shape[0] * frame_bgr.shape[1] * args.sign_proposal_max_area_ratio)
@@ -465,6 +484,7 @@ def sign_candidates_by_color(frame_bgr, args):
 
 
 @torch.no_grad()
+#classify a candidate sign crop and reject background
 def classify_sign_crop(frame_bgr, box, classifier, args):
     if classifier is None:
         return None, 0.0, 0.0
@@ -488,6 +508,7 @@ def classify_sign_crop(frame_bgr, box, classifier, args):
     return label, conf, margin
 
 
+#keep alerts stable across multiple frames
 class AlertFilter:
     def __init__(self, confirm_frames=3):
         self.confirm_frames = confirm_frames
@@ -506,6 +527,7 @@ class AlertFilter:
         return confirmed
 
 
+#orchestrate detection segmentation logic and drawing
 class DriverAssistant:
     def __init__(self, args, sign_classifier=None):
         self.args = args
@@ -515,11 +537,13 @@ class DriverAssistant:
         self.segmenter = RoadSegmenter(args.segformer_model)
         self.alert_filter = AlertFilter(args.alert_confirm_frames)
 
+#draw a single box and label on frame
     def draw_box(self, frame, box, label, color):
         x1, y1, x2, y2 = [int(v) for v in box]
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(frame, label, (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
+#draw confirmed driver warnings at the top
     def overlay_messages(self, frame, messages):
         if not messages:
             return
@@ -539,6 +563,7 @@ class DriverAssistant:
             color = (40, 40, 255) if msg.startswith("CRITICAL") or msg.startswith("STOP") else (0, 255, 255)
             cv2.putText(frame, msg[:110], (24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA)
 
+#detect people and coco stop signs
     def detect_people_and_stop_signs(self, frame, road_mask, sidewalk_mask):
         events = []
         result = self.yolo.predict(frame, conf=self.args.confidence, verbose=False)[0]
@@ -563,6 +588,7 @@ class DriverAssistant:
                 self.draw_box(frame, xyxy, f"stop sign {conf:.2f} | {msg[:48]}", (0, 255, 255))
         return events
 
+#detect signs from custom yolo or color candidates
     def detect_custom_signs(self, frame):
         events = []
         if self.sign_yolo is not None:
@@ -599,6 +625,7 @@ class DriverAssistant:
                 events.append({"key": f"sign_{label}", "message": msg, "priority": 2, "box": xyxy})
         return events
 
+#run all models and draw one annotated frame
     def process_frame(self, frame):
         road_mask, sidewalk_mask = self.segmenter.predict_masks(frame)
         if self.args.show_road_overlay:
@@ -613,6 +640,7 @@ class DriverAssistant:
         return frame, confirmed
 
 
+#protect against overwriting the input video
 def safe_output_path(video_path, output_path):
     video_path = Path(video_path)
     output_path = Path(output_path)
@@ -622,6 +650,7 @@ def safe_output_path(video_path, output_path):
     return output_path
 
 
+#process video and write annotated mp4
 def process_video(args, sign_classifier):
     video_path = Path(args.video)
     if not video_path.exists():
@@ -667,6 +696,7 @@ def process_video(args, sign_classifier):
     return output_path
 
 
+#parse command line configuration
 def parse_args():
     parser = argparse.ArgumentParser(description="annotate road video with pedestrians, street signs, and driver instructions")
     parser.add_argument("--video", required=True)
@@ -705,6 +735,7 @@ def parse_args():
     return parser.parse_args()
 
 
+#load or train classifier and start inference
 def main():
     args = parse_args()
     print(f"using device: {device_name()}")
