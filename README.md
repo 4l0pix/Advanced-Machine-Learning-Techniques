@@ -1,3 +1,5 @@
+![Demo of the Stoic Transformer chat interface](demo.gif)
+
 # Stoic Transformer Language Model: Technical Architecture Report
 
 ## Abstract
@@ -7,7 +9,7 @@ The implementation is intentionally small and readable: tokenization is characte
 
 ## Repository Structure
 - [stoic_transformer_llm.py](stoic_transformer_llm.py): End-to-end training, evaluation, generation, visualization, and artifact export script.
-- [chat-with-the-stoics.py](chat-with-the-stics.py): Console inference client that reconstructs the model and tokenizer, loads a checkpoint, and generates philosopher-styled responses.
+- [chat-with-the-stoics.py](chat-with-the-stoics.py): Console inference client that reconstructs the model and tokenizer, loads a checkpoint, and generates philosopher-styled responses.
 - [stoic_lm_config.json](stoic_lm_config.json): Saved vocabulary, architecture hyperparameters, training metadata, best validation loss, and parameter count.
 - `stoic_lm_best.pt`: Best model checkpoint, expected by [chat-with-the-stoics.py](chat-with-the-stoics.py) by default.
 - `extract_vocab_from_model.py`: Utility script for inspecting or reconstructing vocabulary-related model information.
