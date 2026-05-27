@@ -1,4 +1,12 @@
-![Demo of the Stoic Transformer chat interface](demo.gif)
+<p align="center">
+  <a href="demo.mov">
+    <img src="demo.gif" alt="Demo of the Stoic Transformer chat interface" width="900">
+  </a>
+</p>
+
+<p align="center">
+  <a href="demo.mov">Watch the full demo video (.mov)</a>
+</p>
 
 # Stoic Transformer Language Model: Technical Architecture Report
 
