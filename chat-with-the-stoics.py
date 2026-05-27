@@ -210,7 +210,7 @@ def clear_line():
 
 def print_banner():
     print(f'\n{BOLD}{CYAN}' + '╔' + '═' * 62 + '╗')
-    print('║' + '  🏛️   STOIC PHILOSOPHER CONSOLE CHAT'.center(62) + '║')
+    print('║' + '   STOIC PHILOSOPHER CONSOLE CHAT'.center(62) + '║')
     print('║' + ''.center(62) + '║')
     print('║' + '  Ask a question — all three philosophers will answer.'.center(62) + '║')
     print('║' + '  Type  help  for commands,  quit  to exit.'.center(62) + '║')
