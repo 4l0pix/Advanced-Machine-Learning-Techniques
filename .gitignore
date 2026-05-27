@@ -23,7 +23,6 @@ venv/
 *.png
 *.jpg
 *.jpeg
-*.gif
 *.csv
 *.tsv
 *.log
