@@ -49,8 +49,7 @@ def fetch_text(url: str, timeout: int = 15) -> str:
 def strip_gutenberg_header_footer(text: str) -> str:
     start_markers = ['*** START OF THE PROJECT', '*** START OF THIS PROJECT',
                      '*END*THE SMALL PRINT', 'THE FULL PROJECT']
-    end_markers   = ['*** END OF THE PROJECT', '*** END OF THIS PROJECT',
-                     'End of the Project Gutenberg']
+    end_markers = ['*** END OF THE PROJECT', '*** END OF THIS PROJECT', 'End of the Project Gutenberg']
     for m in start_markers:
         idx = text.find(m)
         if idx != -1:
@@ -163,18 +162,18 @@ if len(FULL_CORPUS) < 5000:
 print(f'\nSample (first 500 chars):\n{FULL_CORPUS[:500]}')
 
 
-n_chars  = len(FULL_CORPUS)
-n_words  = len(FULL_CORPUS.split())
-n_lines  = FULL_CORPUS.count('\n')
+n_chars = len(FULL_CORPUS)
+n_words = len(FULL_CORPUS.split())
+n_lines = FULL_CORPUS.count('\n')
 
 print('Corpus Statistics')
 print('─' * 35)
-print(f'  Characters : {n_chars:>12,}')
-print(f'  Words      : {n_words:>12,}')
-print(f'  Lines      : {n_lines:>12,}')
+print(f'Characters: {n_chars:>12,}')
+print(f'Words: {n_words:>12,}')
+print(f'Lines: {n_lines:>12,}')
 
 
-chars     = sorted(set(FULL_CORPUS))
+chars = sorted(set(FULL_CORPUS))
 VOCAB_SIZE = len(chars)
 print(f'Vocabulary size: {VOCAB_SIZE} characters')
 print(f'Characters: {repr("".join(chars))}')
@@ -197,9 +196,9 @@ print(f'\nEncoded tensor: {DATA.shape}')
 SPLIT = 0.90
 n_train = int(len(DATA) * SPLIT)
 train_data = DATA[:n_train]
-val_data   = DATA[n_train:]
+val_data = DATA[n_train:]
 print(f'Train tokens: {len(train_data):,}')
-print(f'Val   tokens: {len(val_data):,}')
+print(f'Val tokens: {len(val_data):,}')
 
 
 class StoicDataset(Dataset):
@@ -315,19 +314,19 @@ class DecoderBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float):
         super().__init__()
         self.self_attn  = MultiHeadAttention(d_model, num_heads)
-        self.ff         = PositionWiseFeedForward(d_model, d_ff)
-        self.norm1      = nn.LayerNorm(d_model)
-        self.norm2      = nn.LayerNorm(d_model)
-        self.dropout    = nn.Dropout(dropout)
+        self.ff = PositionWiseFeedForward(d_model, d_ff)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
         attn_out = self.self_attn(x, x, x, mask)
-        x        = self.norm1(x + self.dropout(attn_out))
+        x = self.norm1(x + self.dropout(attn_out))
 
 
-        ff_out   = self.ff(x)
-        x        = self.norm2(x + self.dropout(ff_out))
+        ff_out = self.ff(x)
+        x = self.norm2(x + self.dropout(ff_out))
         return x
 
 
@@ -346,15 +345,15 @@ class StoicLM(nn.Module):
     ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoding    = PositionalEncoding(d_model, max_seq_len, dropout)
-        self.blocks          = nn.ModuleList([
+        self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
+        self.blocks = nn.ModuleList([
             DecoderBlock(d_model, num_heads, d_ff, dropout)
             for _ in range(num_layers)
         ])
-        self.norm   = nn.LayerNorm(d_model)
+        self.norm = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size)
 
-        self.d_model     = d_model
+        self.d_model = d_model
         self.max_seq_len = max_seq_len
 
 
@@ -383,7 +382,7 @@ class StoicLM(nn.Module):
 
 
         tok_emb = self.token_embedding(x)
-        h       = self.pos_encoding(tok_emb)
+        h = self.pos_encoding(tok_emb)
 
 
         mask = self._causal_mask(T, x.device)
@@ -392,7 +391,7 @@ class StoicLM(nn.Module):
         for block in self.blocks:
             h = block(h, mask)
 
-        h      = self.norm(h)
+        h = self.norm(h)
         logits = self.lm_head(h)
 
         if targets is None:
@@ -428,11 +427,11 @@ GRAD_CLIP    = 1.0
 
 
 train_dataset = StoicDataset(train_data, BLOCK_SIZE)
-val_dataset   = StoicDataset(val_data,   BLOCK_SIZE)
+val_dataset = StoicDataset(val_data,   BLOCK_SIZE)
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                           drop_last=True,  num_workers=0, pin_memory=True)
-val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False,
+val_loader = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False,
                           drop_last=False, num_workers=0, pin_memory=True)
 
 
@@ -476,7 +475,7 @@ def estimate_loss(model, loader, max_batches: int = 40) -> float:
 
 
 train_losses = []
-val_losses   = []
+val_losses = []
 best_val_loss = float('inf')
 CKPT_PATH = '/kaggle/working/stoic_lm_best.pt'
 
@@ -504,13 +503,13 @@ for epoch in range(1, NUM_EPOCHS + 1):
     scheduler.step()
 
     avg_train = epoch_loss / len(train_loader)
-    avg_val   = estimate_loss(model, val_loader)
+    avg_val = estimate_loss(model, val_loader)
 
     train_losses.append(avg_train)
     val_losses.append(avg_val)
 
     elapsed = time.time() - t0
-    lr_now  = scheduler.get_last_lr()[0]
+    lr_now = scheduler.get_last_lr()[0]
 
     print(f'Ep {epoch:03d}/{NUM_EPOCHS}  |  '
           f'train {avg_train:.4f}  val {avg_val:.4f}  |  '
@@ -589,7 +588,7 @@ def generate(
         ctx = context[:, -BLOCK_SIZE:]
 
         logits, _ = model(ctx)
-        logits     = logits[:, -1, :] / temperature
+        logits = logits[:, -1, :] / temperature
 
 
         if top_k > 0:
@@ -605,7 +604,7 @@ def generate(
 
             logits = logits.scatter(1, sorted_idx, sorted_logits)
 
-        probs   = F.softmax(logits, dim=-1)
+        probs = F.softmax(logits, dim=-1)
         next_id = torch.multinomial(probs, num_samples=1)
 
         context = torch.cat([context, next_id], dim=1)
@@ -670,7 +669,7 @@ def stoic_response(
 ) -> str:
     intro = PHILOSOPHER_INTROS.get(philosopher.lower(),
                                    PHILOSOPHER_INTROS['marcus'])
-    subj  = TOPICS.get(topic.lower(), topic)
+    subj = TOPICS.get(topic.lower(), topic)
     prompt = f'{intro} {subj}'
 
     return generate(
@@ -773,8 +772,8 @@ class StoicLMRecord(StoicLM):
 
 
 VIZ_PHRASE = 'You have power over your mind'
-tokens     = encode(VIZ_PHRASE[:BLOCK_SIZE])
-ctx        = torch.tensor(tokens, dtype=torch.long, device=DEVICE).unsqueeze(0)
+tokens = encode(VIZ_PHRASE[:BLOCK_SIZE])
+ctx = torch.tensor(tokens, dtype=torch.long, device=DEVICE).unsqueeze(0)
 
 
 attn_weights_list = []
@@ -855,21 +854,16 @@ print('  /kaggle/working/attention_maps.png')
 
 
 
-
-print('╔══════════════════════════════════════════════════════════╗')
-print('║          STOIC LM — EXPERIMENT SUMMARY              ║')
-print('╠══════════════════════════════════════════════════════════╣')
-print(f'║  Architecture  : Decoder-only Transformer (GPT-style)   ║')
-print(f'║  Corpus        : Marcus Aurelius, Epictetus, Seneca      ║')
-print(f'║  Vocab size    : {VOCAB_SIZE:<5}  (character-level)             ║')
-print(f'║  Parameters    : {model.count_parameters():>10,}                         ║')
-print(f'║  d_model       : {D_MODEL:<5}                                  ║')
-print(f'║  Attention heads: {NUM_HEADS:<4}                                  ║')
-print(f'║  Decoder layers: {NUM_LAYERS:<4}                                  ║')
-print(f'║  Context window: {BLOCK_SIZE:<4} tokens                          ║')
-print(f'║  Best val loss : {best_val_loss:<6.4f}                               ║')
-print(f'║  Best val PPL  : {math.exp(best_val_loss):<8.2f}                             ║')
-print('╚══════════════════════════════════════════════════════════╝')
+print(f'  Architecture  : Decoder-only Transformer (GPT-style)')
+print(f'  Corpus        : Marcus Aurelius, Epictetus, Seneca')
+print(f'  Vocab size    : {VOCAB_SIZE:<5}  (character-level)')
+print(f'  Parameters    : {model.count_parameters():>10,}')
+print(f'  d_model       : {D_MODEL:<5}')
+print(f'  Attention heads: {NUM_HEADS:<4}')
+print(f'  Decoder layers: {NUM_LAYERS:<4}')
+print(f'  Context window: {BLOCK_SIZE:<4} tokens')
+print(f'  Best val loss : {best_val_loss:<6.4f}')
+print(f'  Best val PPL  : {math.exp(best_val_loss):<8.2f}')
 print()
 print('"Waste no more time arguing about what a good man should be. Be one."')
 print('                                          — Marcus Aurelius')
