@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Outputs
+*.pt
+*.pth
+*.onnx
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.csv
+*.tsv
+*.log
+
+# Local configs
+*.env
