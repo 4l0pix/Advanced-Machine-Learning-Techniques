@@ -3,13 +3,13 @@
 ## Abstract
 This repository implements a compact decoder-only Transformer language model trained on Stoic philosophical texts. The model is GPT-style in the sense that it performs autoregressive next-character prediction with masked self-attention, residual decoder blocks, a causal context window, and sampling-based text generation.
 
-The implementation is intentionally small and readable: tokenization is character-level, the context length is 128 characters, the hidden width is 256, and the trained checkpoint contains 3,180,626 trainable parameters. This document describes the system in code-level detail, with emphasis on the model architecture implemented in [stoic_transformer_llm.py](stoic_transformer_llm.py) and mirrored for inference in [chat.py](chat.py).
+The implementation is intentionally small and readable: tokenization is character-level, the context length is 128 characters, the hidden width is 256, and the trained checkpoint contains 3,180,626 trainable parameters. This document describes the system in code-level detail, with emphasis on the model architecture implemented in [stoic_transformer_llm.py](stoic_transformer_llm.py) and mirrored for inference in [chat-with-stoics.py](chat-with-stoics.py).
 
 ## Repository Structure
 - [stoic_transformer_llm.py](stoic_transformer_llm.py): End-to-end training, evaluation, generation, visualization, and artifact export script.
 - [chat.py](chat.py): Console inference client that reconstructs the model and tokenizer, loads a checkpoint, and generates philosopher-styled responses.
 - [stoic_lm_config.json](stoic_lm_config.json): Saved vocabulary, architecture hyperparameters, training metadata, best validation loss, and parameter count.
-- `stoic_lm_best.pt`: Best model checkpoint, expected by [chat.py](chat.py) by default.
+- `stoic_lm_best.pt`: Best model checkpoint, expected by [chat-with-stoics.py](chat-with-stoics.py) by default.
 - `extract_vocab_from_model.py`: Utility script for inspecting or reconstructing vocabulary-related model information.
 
 ## Data Pipeline
@@ -587,7 +587,7 @@ This model is useful as an educational implementation, but it has several import
 - The chat personas are prompt-based, not separately trained experts.
 
 ## Architecture Fidelity Notes
-The inference implementation in [chat.py](chat.py) intentionally mirrors the training architecture:
+The inference implementation in [chat-with-stoics.py](chat-with-stoics.py) intentionally mirrors the training architecture:
 - Same `MultiHeadAttention` tensor reshaping.
 - Same causal mask construction.
 - Same sinusoidal positional encoding.
