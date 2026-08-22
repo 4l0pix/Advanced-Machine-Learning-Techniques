@@ -1157,4 +1157,4 @@ A: With only 7 years × 12 months = 84 data points, any held-out set would be to
 
 ---
 
-*Documentation generated for LSTM Weather Prediction project — UTH 2026*
+*LSTM Weather Prediction project — UTH 2026*
