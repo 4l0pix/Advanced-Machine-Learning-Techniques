@@ -525,4 +525,4 @@ The loss history across all 50 epochs. Stable, converging curves indicate health
 
 ---
 
-*Documentation by Antigravity — UTH Advanced Machine Learning Techniques 2025-2026*
+*UTH Advanced Machine Learning Techniques 2025-2026*
